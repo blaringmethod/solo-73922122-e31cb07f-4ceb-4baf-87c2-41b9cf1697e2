@@ -12,11 +12,12 @@
 └────────────┘           └─────────────────┘          └──────────────────┘
 ```
 
-- `db/init.sql` —— 全部约束逻辑（表、延迟约束触发器、站点行锁、供数视图），数据库启动时装载，持久化于系统目录
+- `db/init.sql` —— 全部约束逻辑（表、**增量**延迟约束触发器、站点行锁、供数视图），数据库启动时装载，持久化于系统目录
 - `api/` —— FastAPI 应用（变更集 + 转属/拆分/合并/更正便捷端点 + 供数查询）
 - `docker-compose.yml` —— `db`(postgres:16-alpine) + `api`，健康检查串联启动顺序
 - `examples/` —— 转属、历史更正、直连 SQL、并发冲突 四个示例
-- `tests/` —— pytest 集成测试（15 个用例）
+- `scripts/demo_small_vs_big.py` —— 小站/大站合法写入与违规回滚的延迟对照演示
+- `tests/` —— pytest 集成测试（15 个用例）+ 性能回归测试（5 个用例）
 
 ## 数据模型与约束
 
@@ -33,6 +34,27 @@
 
 事务**中途允许暂时违规**（先拆/删时段再补、先补观测再改时段均可），**提交时必须全部满足**，
 否则整笔回滚。任何写路径（API、变更集、直连 SQL）都走同一套约束。
+
+### 增量提交校验（提交延迟与站点历史行数解耦）
+
+早期实现的提交校验对受影响站点做**整站反连接扫描**，大站（N 条历史观测）每新增一条
+合法观测都要付 O(N) 成本，写入延迟随历史线性增长。现改为会话临时表驱动的**增量校验**
+（临时表均为 `ON COMMIT DELETE ROWS`，事务结束自动清空）：
+
+- `dirty_observations`：本事务插入/更新的观测（删除不登记——删观测不会制造孤儿）；
+- `dirty_periods`：本事务插入/更新的时段 id（删除不登记——删时段不会制造重叠）；
+- `dirty_ranges`：本事务插/改/删时段的旧区间与新区间；
+- 提交时按站点去重（`pending_station_checks`），每站只做三件事：
+  1. 仅脏时段 id 对终态做 GiST 重叠探测；
+  2. 仅脏观测逐行做归属点探测（主键 + GiST 索引，常数级 buffer）；
+  3. 仅在脏区间内做观测索引范围扫描，抓因时段变更而失去归属的老观测。
+
+完备性依据：终态中的任何重叠对至少含一个本事务脏时段；任何无归属观测要么自身被插/改，
+要么其原覆盖时段被插/改/删且采样时刻落在登记的旧/新区间内。临时表无统计信息，
+空表也会被优化器估成嵌套循环，因此 2a/2b 先做空表短路（纯观测补录时 `dirty_ranges` 恒空）。
+仅当转属/更正/合并触及 `valid_to IS NULL` 的开放时段时，脏区间为 +∞，该站才退化为全量
+观测扫描——这是结构性的（开放终点确实可能影响全部历史观测），且不属于高频补录路径。
+全量审计函数 `check_station_integrity(station_id)` 保留，供人工运维兜底核查。
 
 ### 并发设计（撤段 vs 补录）
 
@@ -93,40 +115,63 @@ bash examples/04_concurrent_conflict.sh      # 并发：撤段 vs 补录, 必有
 python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 .venv/bin/python -m pytest tests -v          # 需要 compose 栈已启动
 # 可选: API_URL / DATABASE_URL 指向其他实例; PG_LOCK_WAIT_OK=1 启用真并发锁等待用例
+# 性能用例可调: PERF_HISTORY_ROWS=100000(默认 50000)
 bash scripts/selftest.sh                     # 一键: 起栈 + 全部示例 + pytest
 bash scripts/restart_check.sh                # 重启 db/api 后约束仍生效(409/SQL ERROR)
+
+# 小站 vs 大站延迟对照(合法补录同量级; 违规补录 409 整笔回滚, 行数不增加)
+API_URL=http://localhost:8000 \
+DATABASE_URL=postgresql://watershed:watershed@localhost:5432/watershed \
+python3 scripts/demo_small_vs_big.py
 ```
 
 ## 验证状态（如实说明）
 
-已在 **PostgreSQL 16.16 + FastAPI 0.163（本机直连，与 compose 相同的 init.sql 与启动命令）** 上验证：
+已在 **PostgreSQL 16.16 + FastAPI（本机 conda 环境，与 compose 相同的 init.sql 与 uvicorn 启动命令）** 上验证：
 
-- ✅ 15 个集成用例中 14 通过、1 个按环境跳过：建站/时段/观测增删改查、左闭右开边界、
-  重叠拒绝、无归属拒绝、**中途违规提交前修复→成功**、**提交仍违规→整笔回滚**、
-  转属/拆分/合并/历史更正、供数按采样时刻关联、未提交数据不可见（READ COMMITTED）、
-  撤段与补录两种时序的拒绝路径、无关站并发各自提交、直连 SQL 同等约束；
-- ✅ 三个示例脚本（转属 / 历史更正 / 直连 SQL）实际运行输出正确；
-- ✅ 约束为持久化目录对象（`pg_trigger.tgdeferrable=t, tginitdeferred=t`），
-  并在**全新 initdb 集群**上重放 `init.sql` 后同样生效（重启/重建等效证据）；
-- ✅ `SET CONSTRAINTS ALL IMMEDIATE` 后继续修改，提交时仍会重新强检；
+- ✅ 集成测试 **19 通过、1 按环境跳过**：原 15 用例（14 通过 1 跳过）+ 新增 5 个性能/增量校验用例
+  （大站延迟不随历史增长、大站违规补录回滚、观测时刻变更不留孤儿、时段平移不留孤儿、
+  2000 行批量变更集按站去重一次检完）；
+- ✅ 性能 A/B（每条补录独立提交，同机同数据）：
+
+  | 站点历史行数 | 旧实现（整站扫描）平均 | 新实现（增量校验）平均 |
+  |---|---:|---:|
+  | 1,000 | 7.0 ms | 4.4 ms |
+  | 10,000 | 53.2 ms | 2.5 ms |
+  | 50,000 | 268.0 ms | 2.5 ms |
+  | 100,000 | 701.7 ms | 2.5 ms |
+  | 200,000 | 1269.6 ms | 2.5 ms |
+
+  新实现各档持平（约 2.5 ms），20 万行站提交校验的实际计划只触达 6 个共享 buffer（脏行主键
+  + GiST 点探测），与历史行数无关；旧实现同档为 40 万 buffer 的嵌套循环反连接；
+- ✅ 10 个增量校验边界用例（直连 SQL）：时刻变更/时段平移/站间转移的违规拒绝与整笔回滚、
+  中途违规提交前修复、`SET CONSTRAINTS IMMEDIATE` 后提交仍强检、TRUNCATE 禁止、多站混合
+  事务一站违规全笔回滚、开放终点转属后供数正确；
+- ✅ 示例 1（转属）、2（历史更正）、3（直连 SQL 三类违规均拒绝）实际运行输出正确；
+  `scripts/demo_small_vs_big.py` 经 HTTP API 实测大站 10 万行补录与小站同量级、违规 409 回滚；
+- ✅ 约束仍为持久化目录对象（`pg_trigger.tgdeferrable=t, tginitdeferred=t`），
+  全新 initdb 集群重放 `init.sql` 后生效；全量审计函数 `check_station_integrity()` 保留可用；
 - ✅ `/docs` 与 `/openapi.json` 可访问（HTTP 200）。
 
 未能在本环境验证（本机无 Docker，且沙箱阻断进程间信号导致**锁等待无法被唤醒**）：
 
-- ⚠️ `docker compose up` 的端到端启动未实际执行；compose/Dockerfile 已做结构与语法校验，
+- ⚠️ `docker compose up` 的端到端启动未实际执行；compose/Dockerfile 未改动，已做结构与语法校验，
   栈内各组件（同一 `init.sql` 的 PG16、同一 uvicorn 命令）已分别本机验证；
 - ⚠️ 真并发下"锁等待→唤醒→提交时被拒"的跨进程路径（`PG_LOCK_WAIT_OK=1` 的用例、
-  示例 04 场景 1）在本沙箱跳过；其**拒绝逻辑**已由顺序化等价用例覆盖
-  （后者看到前者已提交状态后，提交时校验拒绝），锁等待/唤醒本身为 PostgreSQL 既有机制；
+  示例 04 场景 1）在本沙箱跳过/挂起；已验证行锁本身有效（等待方 `pg_stat_activity`
+  显示 `wait_event_type=Lock`），其**拒绝逻辑**由顺序化等价用例与边界用例覆盖，
+  锁等待/唤醒本身为 PostgreSQL 既有机制；
 - ⚠️ `scripts/restart_check.sh` 的进程重启未在本沙箱执行（无法向进程发信号）。
 
 ## 设计取舍与限制
 
 - 约束用延迟触发器而非排他约束：覆盖检查需要"观测必须有归属"这类跨表规则，
   且要求事务中途可违规、提交时统一校验；
-- 提交时校验按站点去重（会话临时表 `pending_station_checks`，`ON COMMIT DELETE ROWS`），
+- 提交校验改为脏数据驱动的增量检查：按站点去重（会话临时表，`ON COMMIT DELETE ROWS`），
   一笔事务改 N 行只对该站检一次；站点行再次被修改时"已检"标记失效（兼容 `SET CONSTRAINTS IMMEDIATE`）；
+  临时表无统计信息，空表先短路避免优化器选成嵌套循环全扫；
+- 触及开放终点时段（转属/更正/合并，`valid_to IS NULL`）的事务仍会全量扫描该站观测，
+  这是语义上不可避免的（开放区间可能覆盖任意历史时刻），属低频维护路径；高频补录路径不受影响；
 - 超级用户/表主仍可 `DISABLE TRIGGER` 或 `session_replication_role=replica` 绕过——
   数据库层面无法防止拥有者自毁，生产上应收回应用账号的 DDL 权限；
-- 校验为每站 `O(时段数² → 索引下近似线性)` + 一次反连接扫描，适合站点级并发负载；
-  超大批量导入建议走 `/changesets` 单事务提交。
+- 超大批量导入建议走 `/changesets` 单事务提交（每站仅一次增量校验，2000 行实测亚秒级）。
