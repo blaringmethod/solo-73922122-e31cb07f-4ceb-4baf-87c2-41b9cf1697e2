@@ -1,0 +1,32 @@
+name: watershed-attribution
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: watershed
+      POSTGRES_PASSWORD: watershed
+      POSTGRES_DB: watershed
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watershed -d watershed"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://watershed:watershed@db:5432/watershed
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
